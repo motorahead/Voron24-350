@@ -1,0 +1,325 @@
+#####################################################################
+# Smart Bed Fan Control System
+#####################################################################
+#  DISCLAIMER #
+#  Script inspired by Ellis benfans.cfg and 3DPRintDemon's Bbed fans monitor.
+#    - https://github.com/VoronDesign/VoronUsers/tree/8e5067f4f6457da8a552983dd210ec48c40be2ca/printer_mods/Ellis/Bed_Fans/Klipper_Macros
+#      - https://github.com/3DPrintDemon/Demon_Klipper_Essentials_Unified
+#    - Development supported by Gemini in addition to my functional testing and code verification.
+#
+#
+# FEATURES #
+#  Design philopshy prioritizes a turn key, autonomous chamber tempurature management tool.
+#    - Includes heating logic, bed and chamber tempurature response logic, safety and error protection, and bed/chamber cooldown logic.
+#  
+#  Heat-Up Efficiency and "Not Heating at Expected Rate" Protection
+#    - Fans stay OFF during M190 to prioritize bed heating.
+#    - Gradually ramps up fan speeds to prevent bed temperature drops.
+#    - Throttles fans if bed temp drops >2°C below target.
+#
+#  Dynamic Chamber Temperature Management
+#    - Dynamically adjusts fan speeds with damping thresholds to maintain chamber temperature target.
+#
+#  Preventative Print Warping via Chamber Cool Down Management
+#    - Initiates 100% bed fan speeds, then slows when defined bed / chamber delta is met.
+#    - Defined value allows for slower cooling, but safer for ABS / faster cooling, but more risk.
+#    - Auto-Shutdown once the bed reaches defined cooling threshold.
+#
+#####################################################################
+
+[gcode_macro _BEDFANVARS]
+variable_fan:                    "Bed_Fans"     # Fan name in printer.cfg.
+variable_chamber_sensor:         "Chamber_Temp" # Temperature sensor in printer.cfg.
+variable_heating_threshold:      90             # Minimum bed temperature target to enable bed fans (IE: Not used for PLA).
+variable_slow:                   0.25           # Minimum fan speed. Default 0.25 (25%) for non-PWM fans to prevent stalling.
+variable_fast:                   1.0            # Max fan speed (1 = 100%).
+variable_cooling_threshold:      40             # Bed temperature target during cooldown to auto-shutdown.
+variable_cooling_delta:          10             # Switch to 'slow' once the temp gap between bed and chamber is less than this. Higher = slower cooling (safer for ABS). Lower = faster cooling (more risk).
+variable_ramp_increment:         0.05           # Fan speed step percentage (0.05 = 5%) during adjustments.
+variable_chamber_target_default: 63             # Fallback temp if the slicer sends 0c chamber target. Also used for functional testing (TEST_FAN_RAMP).
+
+# DON'T CHANGE THESE VALUES
+variable_last_extruder_target:   0              # DO NOT MODIFY. Temp hand-off from CHAMBER_SOAK to PRINT_START_RESUME.
+variable_chamber_target:         0              # DO NOT MODIFY. Placeholder Value will be overwritten by slicer.
+variable_last_x_wait:            0              # DO NOT MODIFY. X hand-off for parking.
+variable_last_y_wait:            0              # DO NOT MODIFY. Y hand-off for parking.
+gcode:
+
+[gcode_macro BEDFANSSLOW]
+gcode:
+    {% set slow = printer["gcode_macro _BEDFANVARS"].slow|float %}
+    {% set fan = printer["gcode_macro _BEDFANVARS"].fan %}
+    SET_FAN_SPEED FAN={fan} SPEED={slow}
+
+[gcode_macro BEDFANSFAST]
+gcode:
+    {% set fast = printer["gcode_macro _BEDFANVARS"].fast|float %}
+    {% set fan = printer["gcode_macro _BEDFANVARS"].fan %}
+    SET_FAN_SPEED FAN={fan} SPEED={fast}
+
+[gcode_macro BEDFANSOFF]
+gcode:
+    {% set fan = printer["gcode_macro _BEDFANVARS"].fan %}
+    SET_FAN_SPEED FAN={fan} SPEED=0
+
+[gcode_macro CHAMBER_SOAK]
+gcode:
+    # Fetch parameters.
+    # TEMP can default to 0 (triggering the logic below), 
+    # but EXTRUDER is mandatory for a safe hand-off.
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set raw_target = params.TEMP|default(0)|float %}
+    {% set extruder_target = params.EXTRUDER|int %} 
+    {% set x_wait = params.X|float %}
+    {% set y_wait = params.Y|float %}
+    {% set current_temp = printer["temperature_sensor Chamber_Temp"].temperature|float %}
+    
+    # Initializing message only on the FIRST call
+    {% if vars.chamber_target == 0 %}
+        M118 Initializing chamber thermal management...
+    {% endif %}
+    
+    # Determine goal (Slicer vs Default)
+    {% set target = 0 %} # <--- INITIALIZE AT TOP LEVEL TO FIX SCOPING BUG
+    {% if raw_target == 0 %}
+        { action_respond_info("WARNING: No chamber target from slicer. Defaulting to %dC heatsoak." % vars.chamber_target_default) }
+        {% set target = vars.chamber_target_default|float %}
+    {% else %}
+        {% set target = raw_target %}
+    {% endif %}
+
+    # Store the slicer's nozzle temp in your "locker" for the resume macro.
+    SET_GCODE_VARIABLE MACRO=_BEDFANVARS VARIABLE=last_extruder_target VALUE={extruder_target}
+    SET_GCODE_VARIABLE MACRO=_BEDFANVARS VARIABLE=chamber_target VALUE={target}
+    SET_GCODE_VARIABLE MACRO=_BEDFANVARS VARIABLE=last_x_wait VALUE={x_wait}
+    SET_GCODE_VARIABLE MACRO=_BEDFANVARS VARIABLE=last_y_wait VALUE={y_wait}
+
+    # Start the wait loop ONLY if we are below target
+    {% if current_temp < target %}
+        M118 Chamber temp {current_temp}C < target {target}C. Entering soak loop.
+        UPDATE_DELAYED_GCODE ID=WAIT_FOR_CHAMBER_LOOP DURATION=1
+    {% else %}
+        M118 Chamber already at target ({current_temp}C). Proceeding to print.
+        PRINT_START_RESUME EXTRUDER={extruder_target} X_WAIT={x_wait} Y_WAIT={y_wait}
+    {% endif %}
+
+[delayed_gcode WAIT_FOR_CHAMBER_LOOP]
+gcode:
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set current = printer["temperature_sensor Chamber_Temp"].temperature|float %}
+    {% set target = vars.chamber_target|float %}
+
+    {% if current < target %}
+        { action_respond_info("Chamber Heatsoak: %.1f / %.1f C" % (current, target)) }
+        UPDATE_DELAYED_GCODE ID=WAIT_FOR_CHAMBER_LOOP DURATION=15
+    {% else %}
+        M118 Chamber target reached!
+        SET_DISPLAY_TEXT MSG="Chamber Ready"
+        # The background heat loop continues to manage the fans during the print
+        # Trigger the second half of startup
+        PRINT_START_RESUME EXTRUDER={vars.last_extruder_target} X_WAIT={vars.last_x_wait} Y_WAIT={vars.last_y_wait}
+    {% endif %}
+
+#####################################################################
+# POWER RAMP LOGIC
+#####################################################################
+[gcode_macro POWER_RAMP]
+gcode:
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set fan = vars.fan %}
+    {% set fast = vars.fast|float %}
+    {% set slow = vars.slow|float %} # We need this to know the starting floor
+    
+    # Read the ACTUAL speed from the hardware
+    {% set current_speed = printer["fan_generic " ~ fan].speed|float %}
+    
+    {% if current_speed < fast %}
+        # If the fan is currently OFF or below 'Slow', kick it to 'Slow' first
+        {% if current_speed < slow %}
+            {% set next_val = slow %}
+        {% else %}
+            # Otherwise, take a normal ramp step
+            {% set next_val = [current_speed + vars.ramp_increment, fast]|min %}
+        {% endif %}
+        SET_FAN_SPEED FAN={fan} SPEED={next_val}
+        M118 Bed Fans Ramping: { (next_val * 100)|int }%
+    {% endif %}
+
+[gcode_macro POWER_BLEED]
+gcode:
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set fan = vars.fan %}
+    {% set slow = vars.slow|float %}
+    
+    # Get actual current speed from the hardware
+    {% set current_speed = printer["fan_generic " ~ fan].speed|float %}
+    
+    {% if current_speed > slow %}
+        # Take one step down, but don't go below the 'slow' floor
+        {% set next_val = [current_speed - vars.ramp_increment, slow]|max %}
+        
+        SET_FAN_SPEED FAN={fan} SPEED={next_val}
+        M118 Chamber Stabilization: Bleeding fans to { (next_val * 100)|int }%
+    {% endif %}
+
+#####################################################################
+# HEATER OVERRIDES
+#####################################################################
+# Standard heater command override to ensure fans don't trigger prematurely
+[gcode_macro SET_HEATER_TEMPERATURE]
+rename_existing: _SET_HEATER_TEMPERATURE
+gcode:
+    {% set heater = params.HEATER|default("None") %}
+    {% set target = params.TARGET|default(0.0)|float %}
+
+    {% if heater|lower == "heater_bed" %}
+        # Only update the target temperature; fan activation is handled by M190
+        _SET_HEATER_TEMPERATURE HEATER={heater} TARGET={target}
+    {% else %}
+        _SET_HEATER_TEMPERATURE {rawparams}
+    {% endif %}
+
+# M140: Set Bed Temperature
+[gcode_macro M140]
+rename_existing: M99140
+gcode:
+    {% set s = params.S|float %}
+    # Updates heater target without initiating fan monitoring loops
+    SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET={s}
+
+# M190: Set Bed Temperature and Wait
+[gcode_macro M190]
+rename_existing: M99190
+gcode:
+    {% set s = params.S|float %}
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+
+    # Initialize monitoring loop in background BEFORE the blocking wait
+    {% if s >= vars.heating_threshold %}
+        UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=1                   # Start the background fan daemon
+    {% else %}
+        BEDFANSOFF                                                          # Ensure fans are off for low-temp materials
+        UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=0                   # Stop the background daemon
+    {% endif %}
+
+    # Now perform the blocking bed wait
+    M99190 S{s}                                                             # Standard Klipper bed wait
+
+#####################################################################
+# MONITORING & THERMAL MANAGEMENT
+#####################################################################
+
+[delayed_gcode bedfanheatloop]
+gcode:
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set bed_target = printer.heater_bed.target|float %}
+    {% set bed_temp = printer.heater_bed.temperature|float %}
+    {% set sensor = vars.chamber_sensor %}
+    {% set current_chamber = printer["temperature_sensor " + sensor].temperature|float %}
+    {% set target_chamber = vars.chamber_target|float %}
+
+    {% if bed_target >= vars.heating_threshold %}
+        # MANAGE BED HEATING AND RECOVERY FROM HEAT LOSS(Stay at slow speed until bed reaches near target)
+        # Prevents "Not heating at expected rate" errors during the initial ramp.
+        {% if bed_temp < (bed_target - 4.0) %}
+            # Only notify if fans were actually above the slow floor
+            {% if printer["fan_generic " + vars.fan].speed|float > vars.slow|float %}
+                M118 Bed fans off: Not within 4c of bed target.
+            {% endif %}
+			BEDFANSOFF
+            UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=5
+        {% elif bed_temp < (bed_target - 2.0) %}
+            # Only notify if fans were actually above the slow floor
+            {% if printer["fan_generic " + vars.fan].speed|float > vars.slow|float %}
+                M118 "Not heating at expected rate" protection: Fans switched to slow.
+            {% endif %}
+			BEDFANSSLOW
+            UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=5
+        {% else %}
+            # MAINTAIN CHAMBER TEMP
+            # Only ramp down if we exceed target (with buffer)
+            {% if current_chamber > (target_chamber + 0.2) %}
+                # Target met: Bleed off speed
+                POWER_BLEED
+                UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=30 # Damping: Wait longer for air to settle
+            {% elif current_chamber < (target_chamber - 0.5) %}
+                # Only ramp up if we drop below target (The Deadzone)
+                POWER_RAMP 
+                UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=15 # Faster response when climbing
+            {% else %}
+                # Within the "Sweet Spot" - Do nothing, just maintain current speed
+                UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=15
+            {% endif %}
+        {% endif %}
+    {% else %}
+        # STOP LOOP & CLEANUP
+        BEDFANSOFF
+        M118 Bed target below threshold. Fans deactivated.
+        UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=0
+    {% endif %}
+
+[delayed_gcode bedfancoolloop]
+gcode:
+    {% set vars = printer["gcode_macro _BEDFANVARS"] %}
+    {% set bed_temp = printer.heater_bed.temperature|float %}
+    {% set sensor = vars.chamber_sensor %}
+    {% set chamber_temp = printer["temperature_sensor " + sensor].temperature|float %}
+
+    {% if bed_temp >= vars.cooling_threshold %}
+        {% if bed_temp > (chamber_temp + vars.cooling_delta) %}
+            BEDFANSFAST
+            UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=5
+        {% elif bed_temp > chamber_temp %}
+            BEDFANSSLOW
+            UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=5
+        {% else %}
+            BEDFANSOFF
+            UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=0
+        {% endif %}
+    {% else %}
+        BEDFANSOFF
+        UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=0
+    {% endif %}
+
+#####################################################################
+# FUNCTIONAL TESTING
+#####################################################################
+[gcode_macro TURN_OFF_HEATERS]
+rename_existing: _TURN_OFF_HEATERS
+gcode:
+    _TURN_OFF_HEATERS
+    # Stop the heating loop and start cooldown
+    UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=0
+    UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=1
+
+#####################################################################
+# FUNCTIONAL TESTING
+#####################################################################
+[gcode_macro TEST_FAN_RAMP]
+gcode:
+    # 1. Pull the target from variables block above
+    {% set target = printer["gcode_macro _BEDFANVARS"].chamber_target_default %}
+
+    # 2. Cancel any existing loop to prevent "double-timing"
+    UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=0
+    
+    # 3. Start a fresh loop immediately
+    UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=1
+    
+    # 4. Feedback to console
+    M118 Testing Ramp: Target {target}C. Initializing loop...
+
+
+[gcode_macro TEST_FAN_COOLDOWN]
+gcode:
+    # 1. Stop the heat-management logic
+    UPDATE_DELAYED_GCODE ID=bedfanheatloop DURATION=0
+    
+    # 2. Kill all heaters (Safe State)
+    M118 [Testing Cooldown]
+    M118 Killing all heaters...
+    TURN_OFF_HEATERS
+    
+    # 3. Start the cooling logic
+    M118 Starting Cooldown Loop...
+    UPDATE_DELAYED_GCODE ID=bedfancoolloop DURATION=1
